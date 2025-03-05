@@ -1,279 +1,262 @@
-use disk_mpmc::manager::DataPagesManager;
-use disk_mpmc::{GenReceiver, Receiver, Sender};
-use std::collections::HashMap;
-use std::ffi::OsString;
-use std::fs;
-use std::io::{BufRead, BufReader, BufWriter, Write};
-use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
-use std::time::Duration;
+use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Duration};
 
-use tracing::{debug, error, info, info_span, instrument, trace, trace_span, warn};
+use axum::{
+    body::Body,
+    extract::{
+        ws::{close_code, CloseFrame, Message, Utf8Bytes, WebSocket},
+        Path, State, WebSocketUpgrade,
+    },
+    http::StatusCode,
+    response::Response,
+};
+use disk_chan::{Consumer, Producer};
+use tokio::{
+    net::{TcpListener, TcpStream},
+    select,
+};
+use tokio_stream::StreamExt;
+use tokio_util::{
+    codec::{FramedRead, LinesCodec},
+    sync::CancellationToken,
+    task::TaskTracker,
+};
+use tracing::{debug, error, info};
 
-use crate::protocol;
+use crate::{try_handshake, Config};
 
-pub struct FranzServer {
-    server_path: PathBuf,
-    topics: HashMap<OsString, DataPagesManager>,
-    sock_addr: SocketAddr,
-    running: Arc<AtomicBool>,
+pub struct AppState {
+    _data_dir: PathBuf,
+    ws_tracker: TaskTracker,
+    shutdown: CancellationToken,
+    topics: HashMap<String, disk_chan::Producer>,
 }
 
-impl FranzServer {
-    #[instrument]
-    pub fn new(server_path: PathBuf, bind_ip: IpAddr, port: u16) -> FranzServer {
-        let sock_addr = SocketAddr::new(bind_ip, port);
-        let topics = HashMap::new();
+impl AppState {
+    pub async fn cleanup_with_timeout(&self, timeout: Duration) {
+        self.shutdown.cancel();
+        self.ws_tracker.close();
+        select! {
+            _ = self.ws_tracker.wait() => {},
+            _ = tokio::time::sleep(timeout) => {
+                error!("failed to shutdown gracefully, some tasks are still running");
+                error!("forcefully removing lock on disk-chan - this can potentially cause data corruption");
+                let _ = std::fs::remove_file(self._data_dir.join(".pid.lock"));
+            },
+        };
+    }
 
-        let running = Arc::new(AtomicBool::new(true));
-        let r = running.clone();
+    pub async fn new(shutdown: CancellationToken, config: Config) -> Self {
+        let mut topics = HashMap::new();
 
-        ctrlc::set_handler(move || {
-            r.store(false, Ordering::Relaxed);
-        })
-        .expect("Error setting Ctrl-C handler");
+        for t in config.topic {
+            let producer = disk_chan::new(config.data_dir.join(&t.name), t.page_size, t.max_pages)
+                .await
+                .unwrap();
 
-        FranzServer {
-            sock_addr,
+            topics.insert(t.name, producer);
+        }
+
+        AppState {
+            _data_dir: config.data_dir,
+            ws_tracker: TaskTracker::new(),
+            shutdown,
             topics,
-            server_path,
-            running,
         }
     }
+}
 
-    #[instrument(err, skip(self, topic), fields(topic = %topic.as_ref().display()))]
-    fn handle_produce<P: AsRef<Path>>(
-        &mut self,
-        sock: TcpStream,
-        topic: P,
-    ) -> Result<(), std::io::Error> {
-        let Some(topic) = topic.as_ref().file_name() else {
-            return Err(std::io::Error::other("unable to parse topic"));
+async fn handle_produce_attempt_2(
+    mut sock: TcpStream,
+    mut consumer: Consumer,
+    shutdown: CancellationToken,
+) {
+    let codec = LinesCodec::new();
+    let mut framed = FramedRead::new(sock, codec);
+
+    loop {
+        let msg = select! {
+            biased;
+
+            // important: shutdown token must be first due to biased select
+            _ = shutdown.cancelled() => break,
+            msg = framed.next() =>  {
+                match msg {
+                    Some(Ok(_)) => continue,
+                    Some(Err(_)) => break,
+                    None => break,
+                }
+            },
+            msg = consumer.recv() => msg,
+        };
+    }
+}
+
+async fn handle_consume(mut ws: WebSocket, mut consumer: Consumer, shutdown: CancellationToken) {
+    loop {
+        let msg = select! {
+            biased;
+
+            // important: shutdown token must be first due to biased select
+            _ = shutdown.cancelled() => break,
+            msg = ws.recv() =>  {
+                match msg {
+                    Some(Ok(_)) => continue,
+                    Some(Err(_)) => break,
+                    None => break,
+                }
+            },
+            msg = consumer.recv() => msg,
         };
 
-        let dp_man = match self.topics.get(topic) {
-            Some(d) => d.clone(),
+        let data = match msg {
+            Some(data) => data,
             None => {
-                fs::create_dir_all(self.server_path.join(topic))?;
-                let d = DataPagesManager::new(self.server_path.join(topic))?;
+                if let Err(e) = consumer.next_page().await {
+                    let _ = ws
+                        .send(Message::Close(Some(CloseFrame {
+                            code: close_code::ERROR,
+                            reason: Utf8Bytes::from("failed to get next page"),
+                        })))
+                        .await;
 
-                self.topics.insert(topic.into(), d.clone());
+                    error!(%e);
 
-                debug!(topic = ?topic, "created new topic");
-
-                d
+                    return;
+                };
+                continue;
             }
         };
 
-        info!(topic = ?topic, "accepted producer");
-
-        let thread_span = trace_span!("producer_thread");
-
-        let mut tx = Sender::new(dp_man.clone())?;
-        std::thread::spawn(move || {
-            let _entered = thread_span.entered();
-
-            let stream = BufReader::new(sock);
-
-            for line in stream.lines() {
-                let line = line?;
-
-                trace!(%line);
-                tx.push(line)?;
-            }
-
-            info!("client disconnected");
-
-            Ok::<(), std::io::Error>(())
-        });
-
-        Ok(())
-    }
-
-    fn push_messages<R: GenReceiver>(sock: TcpStream, mut rx: R) -> Result<(), std::io::Error> {
-        let mut sock_wtr = BufWriter::new(sock);
-
-        loop {
-            let msg = rx.pop()?;
-            sock_wtr.write_all(msg)?;
-            sock_wtr.write_all(b"\n")?;
-
-            sock_wtr.flush()?;
-
-            // WARN: this needs to be feature flagged
-            let msg = String::from_utf8_lossy(msg);
-            trace!(%msg);
-        }
-
-        #[allow(unreachable_code)]
-        Ok::<(), std::io::Error>(())
-    }
-
-    #[instrument(skip(sock))]
-    fn keepalive(sock: TcpStream, timeout: Duration) {
-        let mut poll = String::new();
-        if let Err(e) = sock.set_read_timeout(Some(timeout)) {
-            error!(%e);
-            let _ = sock.shutdown(std::net::Shutdown::Both);
+        if ws.send(data.into()).await.is_err() {
+            debug!("client closed connection");
             return;
         }
-        let mut sock_rdr = BufReader::new(sock);
-
-        loop {
-            match sock_rdr.read_line(&mut poll) {
-                Ok(_) => debug!("keepalive"),
-                // TODO: check if error is actually a timeout
-                // or something else
-                Err(_) => {
-                    warn!("failed to PING within 75 seconds... disconnecting",);
-                    let _ = sock_rdr.into_inner().shutdown(std::net::Shutdown::Both);
-                    break;
-                }
-            }
-
-            match poll.trim() {
-                "PING" => {}
-                "" => {
-                    debug!("received empty keepalive... exiting");
-                    let _ = sock_rdr.into_inner().shutdown(std::net::Shutdown::Both);
-                    break;
-                }
-                m => {
-                    warn!(%m, "recieved keepalive message that was not 'PING'... exiting");
-
-                    let _ = sock_rdr.into_inner().shutdown(std::net::Shutdown::Both);
-                    break;
-                }
-            }
-
-            poll.clear();
-        }
     }
 
-    #[instrument(err, skip(self, topic), fields(topic = %topic.as_ref().display()))]
-    fn handle_consume<P: AsRef<Path>>(
-        &mut self,
-        sock: TcpStream,
-        group: Option<u16>,
-        topic: P,
-    ) -> Result<(), std::io::Error> {
-        let Some(topic) = topic.as_ref().file_name() else {
-            return Err(std::io::Error::other("unable to parse topic"));
+    let _ = ws
+        .send(Message::Close(Some(CloseFrame {
+            code: close_code::AWAY,
+            reason: Utf8Bytes::from("server shutdown"),
+        })))
+        .await;
+}
+
+pub async fn consume(
+    ws: WebSocketUpgrade,
+    Path((topic, group)): Path<(String, usize)>,
+    State(state): State<Arc<AppState>>,
+) -> Response {
+    let Some(producer) = state.topics.get(&topic) else {
+        return Response::builder()
+            .status(StatusCode::NOT_FOUND)
+            .body(Body::from(format!(
+                "topic with name {topic} does not exist"
+            )))
+            .expect("to never fail");
+    };
+
+    let Ok(consumer) = producer.subscribe(group).await else {
+        return Response::builder()
+            .status(StatusCode::INTERNAL_SERVER_ERROR)
+            .body(Body::from(format!(
+                "unable to subscribe to topic with group {group}"
+            )))
+            .expect("to never fail");
+    };
+
+    ws.on_upgrade(move |sock| {
+        let shutdown = state.shutdown.clone();
+
+        state
+            .ws_tracker
+            .track_future(handle_consume(sock, consumer, shutdown))
+    })
+}
+
+async fn handle_produce(mut ws: WebSocket, mut producer: Producer, shutdown: CancellationToken) {
+    const REASONABLE_CLEANUP_MESSAGE_LIMIT: usize = 10_000;
+
+    loop {
+        let msg = select! {
+            biased;
+
+            // important: shutdown token must be first due to biased select
+            _ = shutdown.cancelled() => break,
+            msg = ws.recv() => msg,
         };
 
-        let topic = topic.to_owned();
-
-        let dp_man = match self.topics.get(&topic) {
-            Some(d) => d.clone(),
-            None => {
-                fs::create_dir_all(self.server_path.join(&topic))?;
-                let d = DataPagesManager::new(self.server_path.join(&topic))?;
-
-                self.topics.insert(topic.clone(), d.clone());
-
-                debug!(topic = ?topic, "created new topic");
-
-                d
-            }
+        let data = match msg {
+            Some(Ok(data)) => data,
+            Some(Err(_)) => break,
+            None => break,
         };
 
-        let sock_c = sock.try_clone()?;
+        if let Err(e) = producer.send(data.into_data()).await {
+            let _ = ws
+                .send(Message::Close(Some(CloseFrame {
+                    code: close_code::ERROR,
+                    reason: Utf8Bytes::from_static("failed to produce message"),
+                })))
+                .await;
 
-        let keepalive_span = info_span!("keepalive_thread");
-        std::thread::spawn(move || {
-            let _entered = keepalive_span.entered();
-            Self::keepalive(sock_c, Duration::from_secs(75))
-        });
+            error!(%e);
 
-        let thread_span = trace_span!("consumer_thread");
-        std::thread::spawn(move || match group {
-            Some(g) => {
-                let _entered = thread_span.entered();
-                let rx = Receiver::new(g.into(), dp_man).unwrap();
-
-                info!(topic = ?topic, group = ?g, "accepted consumer");
-
-                if let Err(err) = Self::push_messages(sock, rx) {
-                    warn!(%err, "tried to push message to closed consumer. message lost")
-                }
-            }
-            None => {
-                let _entered = thread_span.entered();
-                let rx = Receiver::new_anon(dp_man).unwrap();
-
-                info!(topic = ?topic, "accepted anonymous consumer");
-
-                if let Err(err) = Self::push_messages(sock, rx) {
-                    warn!(%err, "tried to push message to closed consumer. message lost")
-                }
-            }
-        });
-
-        Ok(())
-    }
-
-    #[instrument(skip(self))]
-    fn client_handler(&mut self) -> Result<(), std::io::Error> {
-        let listener = TcpListener::bind(self.sock_addr)?;
-
-        loop {
-            if !self.running.load(Ordering::Relaxed) {
-                debug!("exiting client handler (1)");
-                break;
-            }
-
-            let (mut sock, _) = match listener.accept() {
-                Ok((s, a)) => (s, a),
-                Err(e) => {
-                    error!(%e, "failed to accept connection:");
-                    continue;
-                }
-            };
-
-            if !self.running.load(Ordering::Relaxed) {
-                debug!("exiting client handler (2)");
-                break;
-            }
-
-            let handshake = match protocol::Handshake::try_parse(&mut sock) {
-                Ok(h) => h,
-                Err(e) => {
-                    error!(?sock, ?e, "failed to parse handshake");
-                    continue;
-                }
-            };
-
-            if let Err(e) = match handshake.api.as_str() {
-                "produce" => self.handle_produce(sock, handshake.topic),
-                "consume" => self.handle_consume(sock, handshake.group, handshake.topic),
-                "info" => Ok(()),
-                _ => Ok(()),
-            } {
-                error!(%e);
-            }
+            return;
         }
-
-        Ok(())
     }
 
-    pub fn run(mut self) {
-        info!(%self.sock_addr, "starting franz server:");
+    let _ = ws
+        .send(Message::Close(Some(CloseFrame {
+            code: close_code::AWAY,
+            reason: Utf8Bytes::from("server shutdown"),
+        })))
+        .await;
 
-        let running = self.running.clone();
+    //for _ in 0..REASONABLE_CLEANUP_MESSAGE_LIMIT {
+    //    let data = match ws.recv().await {
+    //        Some(Ok(data)) => data,
+    //        Some(Err(_)) => break,
+    //        None => break,
+    //    };
+    //
+    //    if let Err(e) = producer.send(data.into_data()).await {
+    //        error!(%e, "failed to produce message on cleanup");
+    //
+    //        return;
+    //    }
+    //}
+}
 
-        let handle = std::thread::spawn(move || self.client_handler().unwrap());
+pub async fn produce(
+    ws: WebSocketUpgrade,
+    Path(topic): Path<String>,
+    State(state): State<Arc<AppState>>,
+) -> Response {
+    let Some(producer) = state.topics.get(&topic) else {
+        return Response::builder()
+            .status(StatusCode::NOT_FOUND)
+            .body(Body::from(format!(
+                "topic with name {topic} does not exist"
+            )))
+            .expect("to never fail");
+    };
 
-        while running.load(Ordering::Relaxed) {
-            if handle.is_finished() {
-                handle.join().unwrap();
-                break;
-            }
+    let producer = producer.clone();
 
-            std::thread::sleep(Duration::from_secs(2));
-        }
+    ws.on_upgrade(move |sock| {
+        let shutdown = state.shutdown.clone();
 
-        info!("shutting down...")
+        state
+            .ws_tracker
+            .track_future(handle_produce(sock, producer, shutdown))
+    })
+}
+
+pub async fn serve(listener: TcpListener, state: Arc<AppState>) -> Result<(), std::io::Error> {
+    while let Ok((sock, _)) = listener.accept().await {
+        let hs = try_handshake(sock).await.unwrap();
+
+        eprintln!("{:#?}", hs);
     }
+    Ok(())
 }

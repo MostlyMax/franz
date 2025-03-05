@@ -2,7 +2,7 @@
 name = "franz"
 version = "0.7.5"
 edition = "2021"
-authors = ["Maxi Saparov <max.saparov@gmail.com>"]
+authors = ["Maxi Saparov <maxi.saparov@gmail.com>"]
 description = "a simple, friendly, and blazingly fast alternative to Apache Kafka"
 documentation = "https://docs.rs/franz"
 homepage = "https://github.com/MostlyMaxi/franz"
@@ -13,13 +13,17 @@ license = "MIT"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
+axum = { version = "0.8.1", features = ["macros", "ws"] }
 clap = { version = "4.5.8", features = ["derive", "string"] }
-ctrlc = { version = "3.4.4", features = ["termination"] }
-disk-mpmc = "0.4.2"
-num = "0.4.3"
-num-derive = "0.4.2"
-num-traits = "0.2.19"
+disk-chan = { path = "../disk-chan" }
+futures-util = { version = "0.3.31", features = ["sink"] }
+parse-size = "1.1.0"
+serde = { version = "1.0.217", features = ["derive", "serde_derive"] }
+serde_json = "1.0.139"
 thiserror = "1.0.63"
-tokio-scoped = "0.2.0"
+tokio = { version = "1.43.0", features = ["full"] }
+tokio-stream = "0.1.17"
+tokio-util = { version = "0.7.13", features = ["codec", "rt"] }
+toml = "0.8.20"
 tracing = "0.1.40"
 tracing-subscriber = "0.3.18"
